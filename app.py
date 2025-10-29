@@ -1,9 +1,5 @@
 # app.py
 # FastAPI service for 10 km (configurable) buffer + intersection using shapely/pyproj.
-# Endpoints:
-#   GET  /                               -> health
-#   POST /buffer-intersect-files         -> multipart/form-data; two GeoJSON files (coop, protected) + buffer_km
-#   POST /buffer-intersect-batch         -> JSON body; { items: [ {json: {...}}, ... ], buffer_km?: number }
 
 from fastapi import FastAPI, UploadFile, File, Form
 from typing import Any, Dict, List, Optional
@@ -11,6 +7,13 @@ import json
 
 from shapely.geometry import shape, mapping, GeometryCollection
 from shapely.ops import unary_union, transform
+from shapely.errors import GEOSException
+try:
+    # available in most Shapely 1.8+ installs; if not, we'll silently skip
+    from shapely.validation import make_valid  # type: ignore
+except Exception:  # pragma: no cover
+    make_valid = None  # type: ignore
+
 from pyproj import CRS, Transformer
 
 app = FastAPI(title="Geo Buffer/Intersect Service", version="1.0.0")
@@ -22,21 +25,78 @@ to_m    = Transformer.from_crs(crs_wgs, crs_m, always_xy=True).transform
 to_geo  = Transformer.from_crs(crs_m, crs_wgs, always_xy=True).transform
 
 
+# ---- geometry cleaning helpers (only change) ----
+def _to_2d(g):
+    # drop Z if present
+    try:
+        return transform(lambda x, y, z=None: (x, y), g)
+    except Exception:
+        return g
+
+def _fix_valid(g):
+    """Best-effort: drop Z -> make_valid (if available) -> buffer(0)."""
+    if getattr(g, "has_z", False):
+        g = _to_2d(g)
+
+    if make_valid is not None:
+        try:
+            g = make_valid(g)
+        except Exception:
+            pass
+
+    if not g.is_valid:
+        try:
+            g = g.buffer(0)
+        except Exception:
+            pass
+
+    # if still invalid, return None so we can skip it safely
+    return g if g.is_valid else None
+
+def _safe_union(geoms: List):
+    """Stepwise union that skips only geometries that still fail."""
+    if not geoms:
+        return GeometryCollection()
+    u = geoms[0]
+    for g in geoms[1:]:
+        try:
+            u = u.union(g)
+        except GEOSException:
+            # try one more cleaning pass, else skip the offender
+            g2 = _fix_valid(g)
+            if g2 is None:
+                continue
+            try:
+                u = u.union(g2)
+            except GEOSException:
+                # skip this one completely
+                continue
+    return u
+
+
 # ---- helpers ----
 def union_from_fc(fc: Dict[str, Any]):
-    """Dissolve a FeatureCollection into one geometry (or empty)."""
-    geoms = []
+    """Dissolve a FeatureCollection into one geometry (or empty), robustly."""
+    cleaned = []
     for f in (fc or {}).get("features", []):
         try:
             g = shape(f["geometry"])
-            if not g.is_empty:
-                geoms.append(g)
+            g = _fix_valid(g)
+            if g and not g.is_empty:
+                cleaned.append(g)
         except Exception:
             # ignore malformed features
             pass
-    if not geoms:
+
+    if not cleaned:
         return GeometryCollection()
-    return unary_union(geoms)
+
+    # fast path
+    try:
+        return unary_union(cleaned)
+    except GEOSException:
+        # fallback that won't crash the whole request
+        return _safe_union(cleaned)
 
 
 def pick_pair(j: Dict[str, Any]):
@@ -96,6 +156,7 @@ def process_one(j: Dict[str, Any], buffer_m: int = 10_000) -> Dict[str, Any]:
         for g in pieces:
             if g.is_empty:
                 continue
+            # area in meters^2 in projected space
             area_m2 += transform(to_m, g).area
             inter_features.append({
                 "type": "Feature",
@@ -116,9 +177,7 @@ def process_one(j: Dict[str, Any], buffer_m: int = 10_000) -> Dict[str, Any]:
             "type": "Feature",
             "properties": {"coop": coop_name, "buffer_km": round(buffer_m / 1000)},
             "geometry": mapping(coop_buffer)
-        }]
-    }
-
+        }]}
     return {
         "json": {
             "overlapFile": f"{coop_name}__x__{prot_name}__overlap_{round(buffer_m/1000)}km.geojson",
@@ -146,16 +205,8 @@ async def buffer_intersect_files(
     protected: UploadFile = File(...),
     buffer_km: int = Form(10),
 ):
-    """
-    multipart/form-data:
-      coop       -> GeoJSON file (FeatureCollection)
-      protected  -> GeoJSON file (FeatureCollection)
-      buffer_km  -> optional integer, default 10
-    Returns: one {"json": {...}} record.
-    """
     coop_fc = json.loads((await coop.read()).decode("utf-8"))
     prot_fc = json.loads((await protected.read()).decode("utf-8"))
-
     j = {
         "coop": {"name": coop.filename or "coop.geojson", "geojson": coop_fc},
         "protected": {"name": protected.filename or "protected.geojson", "geojson": prot_fc},
@@ -165,17 +216,6 @@ async def buffer_intersect_files(
 
 @app.post("/buffer-intersect-batch")
 def buffer_intersect_batch(payload: Dict[str, Any]):
-    """
-    JSON payload, e.g.:
-      {
-        "items": [
-          { "json": { coop:{name,geojson}, protected:{name,geojson} } },
-          { "json": { kind_1,name_1,geojson_1, kind_2,name_2,geojson_2 } }
-        ],
-        "buffer_km": 10
-      }
-    Returns: list of {"json": {...}}.
-    """
     items = payload.get("items")
     if items is None:
         items = [payload]
